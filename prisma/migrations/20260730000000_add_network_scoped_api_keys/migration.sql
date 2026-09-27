@@ -5,16 +5,19 @@
 -- check can be enforced at the DB level in addition to the application layer,
 -- and enables future per-network key scoping in policy enforcement.
 
-ALTER TABLE "ApiKey"
-  ADD COLUMN "network" TEXT;
+-- AlterTable
+ALTER TABLE "ApiKey" ADD COLUMN "network" "WalletNetwork";
 
--- Backfill existing keys from their prefix
-UPDATE "ApiKey"
-  SET "network" = CASE
-    WHEN "keyPrefix" LIKE 'mux_live_%' THEN 'MAINNET'
-    WHEN "keyPrefix" LIKE 'mux_test_%' THEN 'TESTNET'
-    ELSE NULL
-  END;
+-- CreateIndex
+CREATE INDEX "ApiKey_network_idx" ON "ApiKey"("network");
 
--- Index for network-scoped queries
-CREATE INDEX "ApiKey_network_idx" ON "ApiKey" ("network");
+-- Backfill: bind existing keys to the network of their owning wallet so that
+-- network scoping is fail-closed (a key can only be used against the network
+-- its wallet belongs to). Keys whose wallet network cannot be resolved are
+-- left NULL and are therefore denied by the guard (deny-by-default).
+UPDATE "ApiKey" AS k
+SET "network" = w."network"
+FROM "Wallet" AS w
+WHERE k."walletId" = w."id"
+  AND k."network" IS NULL;
+

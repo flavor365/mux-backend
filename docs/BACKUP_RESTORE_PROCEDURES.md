@@ -186,10 +186,209 @@ If a restore introduces regressions:
 
 ---
 
-## 8. Cross-References
+## 8. Backup Module Invariants
+
+These invariants MUST hold for every backup/restore operation. They are enforced by the backup module and covered by automated tests.
+
+1. **Deny-by-default authz**: Every backup/restore entrypoint requires an authenticated principal (owner, guardian, API key, or JWT). Requests without a valid credential are rejected with `401`; requests with an insufficient role are rejected with `403`. There is no anonymous access path.
+2. **Idempotency**: Backup and restore requests carry an idempotency key. Concurrent or replayed requests with the same key return the original result and never re-execute side effects.
+3. **Fail-closed writes**: If a dependency (RPC, DB, or Horizon) is unavailable, write operations fail closed with a stable error code. No partial or best-effort writes are performed.
+4. **Source of truth**: The server/contract remains the source of truth for spends, recovery, and admin. Backup metadata is advisory and never overrides on-chain state.
+5. **No secret leakage**: Logs and metrics redact keys, JWTs, webhook secrets, and raw key material. Only correlation ids and stable error codes are emitted.
+
+### Stable Error Codes
+
+| Code | Meaning |
+|------|---------|
+| `BACKUP_UNAUTHORIZED` | Missing or invalid credential (401) |
+| `BACKUP_FORBIDDEN` | Authenticated but insufficient role (403) |
+| `BACKUP_DEPENDENCY_UNAVAILABLE` | RPC/DB/Horizon unavailable; write failed closed (503) |
+| `BACKUP_IDEMPOTENCY_CONFLICT` | Same idempotency key reused with a different payload (409) |
+| `BACKUP_INVALID_INPUT` | Adversarial or malformed input, e.g. oversized batch (400) |
+| `BACKUP_INTERNAL_ERROR` | Unexpected failure (500) |
+
+Every response includes a `correlationId` for tracing. Correlation ids are safe to log; credentials and key material are not.
+
+---
+
+## 9. Backup Admin Endpoints
+
+All endpoints require authentication. In addition to the `X-Cron-Secret` header used by scheduled jobs, callers may authenticate as an owner/guardian via API key or JWT. Requests are denied by default when no valid credential is present.
+
+### Health Check
+
+**Endpoint:** `GET /backup/health`
+
+Verifies that the database connection is healthy and ready for backup operations.
+
+```bash
+curl -H "X-Cron-Secret: ${CRON_SECRET}" \
+  https://api.example.com/backup/health
+```
+
+**Response:**
+```json
+{
+  "databaseHealthy": true,
+  "connectionWorks": true,
+  "query": "success",
+  "timestamp": "2026-01-01T00:00:00.000Z",
+  "correlationId": "corr_1704067200000_abc123def",
+  "message": "Database connection is healthy"
+}
+```
+
+### Collect Backup Metadata
+
+**Endpoint:** `POST /backup/metadata`
+
+Collects current database metadata including record counts and timestamps. This should be saved for backup verification. The request is idempotent when an `Idempotency-Key` header is supplied.
+
+```bash
+curl -X POST -H "X-Cron-Secret: ${CRON_SECRET}" \
+  -H "Idempotency-Key: backup-2026-01-01" \
+  https://api.example.com/backup/metadata
+```
+
+**Response:**
+```json
+{
+  "backupId": "backup_1704067200000_abc123def",
+  "timestamp": "2026-01-01T00:00:00.000Z",
+  "duration": 1234,
+  "status": "success",
+  "correlationId": "corr_1704067200000_abc123def",
+  "recordCounts": {
+    "users": 100,
+    "wallets": 250,
+    "transactions": 1500,
+    "apiKeys": 50,
+    "projects": 10,
+    "developers": 5
+  }
+}
+```
+
+### Restore Drill
+
+**Endpoint:** `POST /backup/drill`
+
+Performs a non-destructive validation that the database can be restored from backup. Checks:
+- All required tables exist
+- Record counts are consistent
+- Foreign key constraints are intact
+- Indexes are present
+
+```bash
+curl -X POST -H "X-Cron-Secret: ${CRON_SECRET}" \
+  -H "Idempotency-Key: drill-2026-01-01" \
+  https://api.example.com/backup/drill
+```
+
+**Response:**
+```json
+{
+  "drillId": "drill_1704067200000_xyz789",
+  "timestamp": "2026-01-01T00:00:00.000Z",
+  "success": true,
+  "correlationId": "corr_1704067200000_xyz789",
+  "validationResults": {
+    "tablesExist": true,
+    "recordsCountMatch": true,
+    "constraintsIntact": true,
+    "indexesPresent": true
+  },
+  "recordCounts": {
+    "users": 100,
+    "wallets": 250,
+    "transactions": 1500,
+    "apiKeys": 50,
+    "projects": 10,
+    "developers": 5
+  },
+  "duration": 2345
+}
+```
+
+### Backup Procedures
+
+**Endpoint:** `GET /backup/procedures`
+
+Returns operational procedures for backup and restore.
+
+```bash
+curl -H "X-Cron-Secret: ${CRON_SECRET}" \
+  https://api.example.com/backup/procedures
+```
+
+---
+
+## 10. Troubleshooting
+
+### Health Check Fails
+
+**Error:** `"databaseHealthy": false`
+
+**Solutions:**
+- Check database is running: `psql -c "SELECT 1"`
+- Check network connectivity to database host
+- Check security groups / firewall rules
+- Check database credentials in environment
+
+### Restore Drill Fails - Constraints
+
+**Error:** `"constraintsIntact": false`
+
+**Causes:**
+- Foreign key violations in restored data
+- Orphaned records (wallet without user, etc.)
+
+**Solutions:**
+- Run constraint checks in database: `SELECT * FROM information_schema.table_constraints`
+- Identify orphaned records and delete them
+- Re-run restore drill
+
+### Dependency Outage (RPC/DB/Horizon)
+
+**Error:** `BACKUP_DEPENDENCY_UNAVAILABLE`
+
+**Behavior:** Write operations fail closed. The backup module does not attempt partial writes and does not fall back to a stale cache.
+
+**Solutions:**
+- Check dependency status pages (RPC, Horizon, managed DB)
+- Retry once the dependency recovers; the idempotency key makes retries safe
+- Do not disable fail-closed behavior to force a write through
+
+### Idempotency Conflict
+
+**Error:** `BACKUP_IDEMPOTENCY_CONFLICT`
+
+**Cause:** The same `Idempotency-Key` was reused with a different payload.
+
+**Solutions:**
+- Use a fresh idempotency key for a genuinely new operation
+- Reuse the original key only to retrieve the original result
+
+### High Restore Duration
+
+**Issue:** Restore drill takes longer than expected
+
+**Solutions:**
+- Check database load (other queries running)
+- Check disk I/O performance
+- Check network latency if remote database
+- Consider adding indexes to frequently-queried tables
+
+---
+
+## 11. Cross-References
 
 - [Key Management Consolidation](./key-management-consolidation.md)
 - [Custody Security Model](./custody-security-model.md)
 - [Key Rotation Audit](../src/key-management/key-rotation-audit.service.ts)
 - [Migration Guide](./MIGRATION-KEY-MANAGEMENT.md)
+- [Database Schema](../prisma/schema.prisma)
+- [Disaster Recovery Runbook](./DISASTER_RECOVERY.md)
+- [Security Policy](../SECURITY.md)
+- [Backup Module E2E Tests](../test/backup-module-registered.e2e-spec.ts)
 - `WALLET_ENCRYPTION_KEY` validation: `src/app.service.ts`

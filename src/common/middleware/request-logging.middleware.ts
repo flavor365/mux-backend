@@ -1,61 +1,54 @@
+import { Injectable, NestMiddleware, Logger } from '@nestjs/common';
 import { Request, Response, NextFunction } from 'express';
-import { Logger } from '@nestjs/common';
-import { randomUUID } from 'crypto';
+import { REQUEST_ID_HEADER, MAX_REQUEST_ID_LENGTH } from '../interceptors/request-id.interceptor';
 
-export function requestLogger(
-  req: Request | any,
-  res: Response | any,
-  next: NextFunction,
-) {
-  const logger = new Logger('RequestLogger');
-  try {
-    const idHeader =
-      req &&
-      req.headers &&
-      (req.headers['x-request-id'] || req.headers['X-Request-Id']);
-    const id =
-      typeof idHeader === 'string' && idHeader.length > 0
-        ? idHeader
-        : randomUUID();
-    const start = Date.now();
+/**
+ * Middleware that ensures every request has a correlation id
+ * in the x-request-id header. If the client supplies one,
+ * it is validated and passed through; otherwise a server-generated
+ * id is set.
+ *
+ * The correlation id is also attached to the request object so
+ * downstream handlers can access it without re-reading headers.
+ */
+@Injectable()
+export class RequestLoggingMiddleware implements NestMiddleware {
+  private readonly logger = new Logger('RequestLogging');
 
-    if (res && typeof res.setHeader === 'function') {
-      try {
-        res.setHeader('x-request-id', id);
-      } catch (e) {
-        /* best-effort */
-      }
+  use(req: Request, res: Response, next: NextFunction): void {
+    const incomingId = req.headers[REQUEST_ID_HEADER] as string | undefined;
+    const requestId = this.normalizeRequestId(incomingId);
+
+    // Attach to request for downstream use
+    (req as any).requestId = requestId;
+
+    // Set response header so the client can correlate
+    res.setHeader(REQUEST_ID_HEADER, requestId);
+
+    this.logger.debug(`${req.method} ${req.url} requestId=${requestId}`);
+
+    next();
+  }
+
+  private normalizeRequestId(incoming: string | undefined): string {
+    if (!incoming) {
+      return this.generateRequestId();
     }
 
-    const ip =
-      (req && (req.ip || (req.socket && req.socket.remoteAddress))) ||
-      'unknown';
-    const method = (req && req.method) || 'UNKNOWN';
-    const url = (req && (req.originalUrl || req.url)) || 'unknown';
-
-    logger.log(`${method} ${url} id=${id} ip=${ip}`);
-
-    if (res && typeof res.on === 'function') {
-      res.on('finish', () => {
-        const ms = Date.now() - start;
-        try {
-          logger.log(`Completed ${res.statusCode || 0} in ${ms}ms id=${id}`);
-        } catch (e) {
-          logger.warn(
-            'Failed to log response finish: ' + (e && (e as Error).message),
-          );
-        }
-      });
+    if (incoming.length > MAX_REQUEST_ID_LENGTH) {
+      return this.generateRequestId();
     }
-  } catch (err: any) {
-    logger.warn('Request logging failed: ' + (err && err.message));
-  } finally {
-    try {
-      next();
-    } catch (e) {
-      logger.warn('next() threw in requestLogger');
+
+    // Only allow safe characters to prevent log injection
+    const pattern = /^[A-Za-z0-9._:-]+$/;
+    if (!pattern.test(incoming)) {
+      return this.generateRequestId();
     }
+
+    return incoming;
+  }
+
+  private generateRequestId(): string {
+    return crypto.randomUUID();
   }
 }
-
-export default requestLogger;
