@@ -5,6 +5,7 @@ import * as crypto from 'crypto';
 import {
   ApiKey,
   ApiKeyStatus,
+  ApiKeyErrorCode,
   Developer,
   Project,
   ApiKeyContext,
@@ -108,11 +109,45 @@ export class ApiKeyService {
   }
 
   /**
-   * Validates an API key and returns context if valid
+   * Validates an API key and returns context if valid.
+   *
+   * @param plainTextKey  The raw key supplied by the client.
+   * @param requiredNetwork  Optional Stellar network the endpoint operates on
+   *   ('MAINNET' | 'TESTNET').  When provided, the key prefix is checked to
+   *   ensure it matches: `mux_live_*` keys are only valid for MAINNET and
+   *   `mux_test_*` keys are only valid for TESTNET.  A mismatch results in a
+   *   structured 401 with errorCode API_KEY_NETWORK_MISMATCH.
    */
-  async validateApiKey(plainTextKey: string): Promise<ApiKeyInfo> {
+  async validateApiKey(
+    plainTextKey: string,
+    requiredNetwork?: 'MAINNET' | 'TESTNET',
+  ): Promise<ApiKeyInfo> {
     if (!plainTextKey || !plainTextKey.startsWith('mux_')) {
-      throw new UnauthorizedException('Invalid API key format');
+      throw new UnauthorizedException({
+        message: 'Invalid API key format',
+        errorCode: ApiKeyErrorCode.INVALID_FORMAT,
+      });
+    }
+
+    // --- Network mismatch check (fail-closed, fail early) ---
+    if (requiredNetwork) {
+      const keyImpliesLive = plainTextKey.startsWith('mux_live_');
+      const keyImpliesTest = plainTextKey.startsWith('mux_test_');
+
+      if (
+        (requiredNetwork === 'MAINNET' && keyImpliesTest) ||
+        (requiredNetwork === 'TESTNET' && keyImpliesLive)
+      ) {
+        const expectedPrefix =
+          requiredNetwork === 'MAINNET' ? 'mux_live_' : 'mux_test_';
+        this.logger.warn(
+          `Network mismatch: key prefix does not match required network ${requiredNetwork}`,
+        );
+        throw new UnauthorizedException({
+          message: `API key network mismatch: a ${expectedPrefix}* key is required for ${requiredNetwork} operations`,
+          errorCode: ApiKeyErrorCode.NETWORK_MISMATCH,
+        });
+      }
     }
 
     // Hash the provided key
@@ -131,20 +166,32 @@ export class ApiKeyService {
     });
 
     if (!apiKeyRecord) {
-      throw new UnauthorizedException('Invalid API key');
+      throw new UnauthorizedException({
+        message: 'Invalid API key',
+        errorCode: ApiKeyErrorCode.NOT_FOUND,
+      });
     }
 
     // Check if key is active or in grace period
     if (apiKeyRecord.status === ApiKeyStatus.REVOKED) {
-      throw new UnauthorizedException('API key has been revoked');
+      throw new UnauthorizedException({
+        message: 'API key has been revoked',
+        errorCode: ApiKeyErrorCode.REVOKED,
+      });
     }
 
     if (apiKeyRecord.status === ApiKeyStatus.SUSPENDED) {
-      throw new UnauthorizedException('API key is suspended');
+      throw new UnauthorizedException({
+        message: 'API key is suspended',
+        errorCode: ApiKeyErrorCode.SUSPENDED,
+      });
     }
 
     if (apiKeyRecord.status === ApiKeyStatus.EXPIRED) {
-      throw new UnauthorizedException('API key has expired');
+      throw new UnauthorizedException({
+        message: 'API key has expired',
+        errorCode: ApiKeyErrorCode.EXPIRED,
+      });
     }
 
     // Check if grace period has ended (for rotated keys)
@@ -152,7 +199,10 @@ export class ApiKeyService {
       apiKeyRecord.gracePeriodEndsAt &&
       apiKeyRecord.gracePeriodEndsAt < new Date()
     ) {
-      throw new UnauthorizedException('API key rotation grace period expired');
+      throw new UnauthorizedException({
+        message: 'API key rotation grace period expired',
+        errorCode: ApiKeyErrorCode.EXPIRED,
+      });
     }
 
     // Check expiration
@@ -162,7 +212,10 @@ export class ApiKeyService {
         where: { id: apiKeyRecord.id },
         data: { status: ApiKeyStatus.EXPIRED },
       });
-      throw new UnauthorizedException('API key has expired');
+      throw new UnauthorizedException({
+        message: 'API key has expired',
+        errorCode: ApiKeyErrorCode.EXPIRED,
+      });
     }
 
     // Update last used timestamp (async, don't await)

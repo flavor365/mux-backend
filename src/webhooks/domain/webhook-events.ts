@@ -38,7 +38,16 @@ export interface WebhookEndpoint {
   projectId: string;
   url: string;
   description?: string | null;
+  /** Current active signing secret. */
   secret: string;
+  /**
+   * New secret created during a dual-secret rotation window.
+   * Signatures produced with either `secret` or `pendingSecret` are accepted
+   * until `pendingSecretExpiresAt`.
+   */
+  pendingSecret?: string | null;
+  /** When the rotation overlap window closes (only `secret` valid after). */
+  pendingSecretExpiresAt?: Date | null;
   events: string[];
   status: string;
   consecutiveFailures: number;

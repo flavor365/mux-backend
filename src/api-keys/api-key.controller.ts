@@ -15,6 +15,8 @@ import {
   ListApiKeysRequest,
 } from './api-key.service';
 import { CreateApiKeyDto } from './dto/create-api-key.dto';
+import { RevokeApiKeyDto } from './dto/revoke-api-key.dto';
+import { RotateApiKeyDto } from './dto/rotate-api-key.dto';
 
 @Controller('api-keys')
 export class ApiKeyController {
@@ -88,7 +90,7 @@ export class ApiKeyController {
   @HttpCode(HttpStatus.OK)
   async revokeApiKey(
     @Param('apiKeyId') apiKeyId: string,
-    @Body() body: { reason?: string; developerId?: string },
+    @Body() body: RevokeApiKeyDto,
   ) {
     const apiKey = await this.apiKeyService.revokeApiKey(
       apiKeyId,
@@ -111,7 +113,7 @@ export class ApiKeyController {
   @HttpCode(HttpStatus.OK)
   async rotateApiKey(
     @Param('apiKeyId') apiKeyId: string,
-    @Body() body: { name?: string; developerId?: string },
+    @Body() body: RotateApiKeyDto,
   ) {
     const result = await this.apiKeyService.rotateApiKey(
       {

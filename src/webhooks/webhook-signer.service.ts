@@ -7,7 +7,11 @@ export interface WebhookSignature {
 }
 
 /**
- * Service for signing and verifying webhook payloads
+ * Service for signing and verifying webhook payloads.
+ *
+ * Dual-secret rotation support:
+ * Use `verifySignatureWithFallback` when a rotation window is active — it
+ * accepts signatures produced with either the current or the pending secret.
  */
 @Injectable()
 export class WebhookSignerService {
@@ -37,9 +41,9 @@ export class WebhookSignerService {
   }
 
   /**
-   * Verifies a webhook signature
+   * Verifies a webhook signature against a single secret.
    *
-   * Use this on the receiving end to verify authenticity
+   * Use this on the receiving end to verify authenticity.
    */
   verifySignature(
     payload: string,
@@ -54,19 +58,54 @@ export class WebhookSignerService {
       return false;
     }
 
-    // Compute expected signature
-    const expectedSignature = this.signPayload(payload, secret, timestamp);
+    return this.constantTimeMatch(payload, signature, secret, timestamp);
+  }
 
-    const a = Buffer.from(signature);
-    const b = Buffer.from(expectedSignature);
-
-    // timingSafeEqual requires equal lengths; mismatched length = invalid
-    if (a.length !== b.length) {
+  /**
+   * Verifies a webhook signature during a dual-secret rotation window.
+   *
+   * Both `primarySecret` (the current/new secret) and `pendingSecret` (the
+   * previous/outgoing secret still within the overlap window) are tried.
+   * Returns `true` if either produces a matching signature.
+   *
+   * @param pendingSecretExpiresAt  When the overlap window closes.  If
+   *   `undefined` or already expired only `primarySecret` is tried.
+   */
+  verifySignatureWithFallback(
+    payload: string,
+    signature: string,
+    primarySecret: string,
+    timestamp: number,
+    pendingSecret?: string | null,
+    pendingSecretExpiresAt?: Date | null,
+    toleranceSeconds: number = 300,
+  ): boolean {
+    // Timestamp replay guard
+    const currentTime = Math.floor(Date.now() / 1000);
+    if (Math.abs(currentTime - timestamp) > toleranceSeconds) {
       return false;
     }
 
-    // Constant-time comparison to prevent timing attacks
-    return crypto.timingSafeEqual(a, b);
+    // Always try primary secret first
+    if (this.constantTimeMatch(payload, signature, primarySecret, timestamp)) {
+      return true;
+    }
+
+    // Fall back to pending secret if the rotation window is still open
+    if (
+      pendingSecret &&
+      pendingSecretExpiresAt &&
+      pendingSecretExpiresAt > new Date()
+    ) {
+      return this.constantTimeMatch(
+        payload,
+        signature,
+        pendingSecret,
+        timestamp,
+      );
+    }
+
+    return false;
   }
 
   /**
@@ -94,5 +133,27 @@ export class WebhookSignerService {
       timestamp: parseInt(timestamp.split('=')[1], 10),
       signature: signature.split('=')[1],
     };
+  }
+
+  /**
+   * Constant-time HMAC comparison for a single (payload, signature, secret) triple.
+   */
+  private constantTimeMatch(
+    payload: string,
+    signature: string,
+    secret: string,
+    timestamp: number,
+  ): boolean {
+    const expected = this.signPayload(payload, secret, timestamp);
+
+    const a = Buffer.from(signature);
+    const b = Buffer.from(expected);
+
+    // timingSafeEqual requires equal lengths; mismatched length = invalid
+    if (a.length !== b.length) {
+      return false;
+    }
+
+    return crypto.timingSafeEqual(a, b);
   }
 }

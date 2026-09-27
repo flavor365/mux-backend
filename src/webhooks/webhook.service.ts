@@ -1,4 +1,5 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaClient } from '../generated/prisma/client';
 import { WebhookEndpoint, EndpointStatus } from './domain/webhook-events';
 import * as crypto from 'crypto';
@@ -17,6 +18,18 @@ export interface UpdateWebhookEndpointRequest {
   status?: string;
 }
 
+export interface RotateSecretResult {
+  /** The new primary secret — store this immediately. */
+  secret: string;
+  /**
+   * The old secret is still accepted as a fallback until
+   * `pendingSecretExpiresAt`.  Update your consumers before this time.
+   */
+  pendingSecretExpiresAt: Date;
+  /** Window duration in seconds. */
+  windowSeconds: number;
+}
+
 /**
  * Webhook Management Service
  */
@@ -24,9 +37,15 @@ export interface UpdateWebhookEndpointRequest {
 export class WebhookService {
   private readonly logger = new Logger(WebhookService.name);
   private prisma: PrismaClient;
+  /** Duration of the dual-secret overlap window in seconds. */
+  private readonly secretRotationWindowSeconds: number;
 
-  constructor() {
+  constructor(private readonly configService: ConfigService) {
     this.prisma = new PrismaClient({} as any);
+    this.secretRotationWindowSeconds = this.configService.get<number>(
+      'WEBHOOK_SECRET_ROTATION_WINDOW_SECONDS',
+      86400, // default: 24 hours
+    );
   }
 
   /**
@@ -112,18 +131,52 @@ export class WebhookService {
   }
 
   /**
-   * Rotates the webhook secret
+   * Rotates the webhook signing secret with a dual-secret overlap window.
+   *
+   * The old secret is stored as `pendingSecret` and remains valid until
+   * `pendingSecretExpiresAt`.  Consumers have until that deadline to update
+   * their verification logic.  After the deadline only the new `secret` is
+   * accepted.
+   *
+   * The window duration is controlled by the
+   * `WEBHOOK_SECRET_ROTATION_WINDOW_SECONDS` environment variable
+   * (default: 86400 = 24 hours).
    */
-  async rotateSecret(endpointId: string): Promise<{ secret: string }> {
-    const newSecret = this.generateSecret();
-
-    await this.prisma.webhookEndpoint.update({
+  async rotateSecret(endpointId: string): Promise<RotateSecretResult> {
+    const existing = await this.prisma.webhookEndpoint.findUnique({
       where: { id: endpointId },
-      data: { secret: newSecret },
     });
 
-    this.logger.log(`Rotated secret for webhook endpoint ${endpointId}`);
-    return { secret: newSecret };
+    if (!existing) {
+      throw new NotFoundException(`Webhook endpoint ${endpointId} not found`);
+    }
+
+    const newSecret = this.generateSecret();
+    const pendingSecretExpiresAt = new Date(
+      Date.now() + this.secretRotationWindowSeconds * 1000,
+    );
+
+    // The current active secret becomes `pendingSecret` (the fallback).
+    // The freshly generated secret becomes the new primary `secret`.
+    await this.prisma.webhookEndpoint.update({
+      where: { id: endpointId },
+      data: {
+        secret: newSecret,
+        pendingSecret: existing.secret,
+        pendingSecretExpiresAt,
+      },
+    });
+
+    this.logger.log(
+      `Rotated secret for webhook endpoint ${endpointId}. ` +
+        `Old secret valid as fallback until ${pendingSecretExpiresAt.toISOString()}.`,
+    );
+
+    return {
+      secret: newSecret,
+      pendingSecretExpiresAt,
+      windowSeconds: this.secretRotationWindowSeconds,
+    };
   }
 
   /**
@@ -154,6 +207,8 @@ export class WebhookService {
       url: prismaEndpoint.url,
       description: prismaEndpoint.description,
       secret: prismaEndpoint.secret,
+      pendingSecret: prismaEndpoint.pendingSecret ?? null,
+      pendingSecretExpiresAt: prismaEndpoint.pendingSecretExpiresAt ?? null,
       events: prismaEndpoint.events,
       status: prismaEndpoint.status,
       consecutiveFailures: prismaEndpoint.consecutiveFailures,

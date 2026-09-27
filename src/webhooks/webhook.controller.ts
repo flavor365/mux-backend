@@ -12,10 +12,11 @@ import {
 } from '@nestjs/common';
 import {
   WebhookService,
-  CreateWebhookEndpointRequest,
   UpdateWebhookEndpointRequest,
 } from './webhook.service';
 import { WebhookDispatcherService } from './webhook-dispatcher.service';
+import { CreateWebhookEndpointDto } from './dto/create-webhook-endpoint.dto';
+import { UpdateWebhookEndpointDto } from './dto/update-webhook-endpoint.dto';
 
 @Controller('webhooks')
 export class WebhookController {
@@ -29,7 +30,7 @@ export class WebhookController {
    */
   @Post('endpoints')
   @HttpCode(HttpStatus.CREATED)
-  async createEndpoint(@Body() request: CreateWebhookEndpointRequest) {
+  async createEndpoint(@Body() request: CreateWebhookEndpointDto) {
     const endpoint = await this.webhookService.createEndpoint(request);
 
     return {
@@ -98,7 +99,7 @@ export class WebhookController {
   @HttpCode(HttpStatus.OK)
   async updateEndpoint(
     @Param('id') id: string,
-    @Body() updates: UpdateWebhookEndpointRequest,
+    @Body() updates: UpdateWebhookEndpointDto,
   ) {
     const endpoint = await this.webhookService.updateEndpoint(id, updates);
 
@@ -122,7 +123,11 @@ export class WebhookController {
   }
 
   /**
-   * Rotates the webhook signing secret
+   * Rotates the webhook signing secret.
+   *
+   * Returns the new primary secret plus a `pendingSecretExpiresAt` timestamp.
+   * The previous secret remains valid as a fallback until that deadline, giving
+   * consumers time to update their signature-verification code.
    */
   @Post('endpoints/:id/rotate-secret')
   @HttpCode(HttpStatus.OK)
@@ -130,7 +135,12 @@ export class WebhookController {
     const result = await this.webhookService.rotateSecret(id);
 
     return {
-      secret: result.secret, // Only time new secret is returned!
+      /** New primary secret — store this immediately. */
+      secret: result.secret,
+      /** Old secret accepted as fallback until this timestamp. */
+      pendingSecretExpiresAt: result.pendingSecretExpiresAt,
+      /** Duration of the overlap window in seconds. */
+      windowSeconds: result.windowSeconds,
       rotatedAt: new Date(),
     };
   }
